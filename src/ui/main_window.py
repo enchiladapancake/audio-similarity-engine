@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor
@@ -114,11 +115,31 @@ class _VectorDiagram(QWidget):
     def _style_axes(self):
         ax = self._ax
         ax.set_facecolor(_BG)
+
+        # Spines: keep but tone down
         for spine in ax.spines.values():
             spine.set_color(_SPINE)
-        ax.tick_params(colors=_SPINE, labelcolor=_SPINE, labelsize=7)
-        ax.set_xlabel("Dimension 1", color=_SPINE, fontsize=8)
-        ax.set_ylabel("Dimension 2", color=_SPINE, fontsize=8)
+
+        # Remove tick marks and tick numbers — UMAP coordinates are meaningless
+        ax.tick_params(
+            bottom=False, left=False,
+            labelbottom=False, labelleft=False,
+        )
+
+        # Semantic axis labels
+        _axis_label = "← more different  |  more similar →"
+        ax.set_xlabel(_axis_label, color=_SUBTLE, fontsize=8, labelpad=6)
+        ax.set_ylabel(_axis_label, color=_SUBTLE, fontsize=8, labelpad=6)
+
+        # Chart title
+        ax.set_title(
+            "Audio Similarity Map",
+            color=_TEXT, fontsize=11, pad=10, fontweight="normal",
+        )
+
+        # Subtle grid — drawn behind everything
+        ax.set_axisbelow(True)
+        ax.grid(True, color="#2e2e2e", linewidth=0.6, alpha=0.8, zorder=0)
 
     def _draw_empty(self):
         self._ax.clear()
@@ -152,13 +173,13 @@ class _VectorDiagram(QWidget):
 
         ax.scatter(
             xs, ys,
-            c=_NEUTRAL_PT, s=60, zorder=2,
+            c=_NEUTRAL_PT, s=85, zorder=2,
             edgecolors="#ffffff22", linewidths=0.5,
         )
         for path, (x, y) in coords.items():
             ax.annotate(
                 self._truncate(path.stem), (x, y),
-                xytext=(4, 4), textcoords="offset points",
+                xytext=(7, 5), textcoords="offset points",
                 color=_TEXT, fontsize=_LABEL_FS, zorder=3,
             )
 
@@ -192,13 +213,13 @@ class _VectorDiagram(QWidget):
             ]
             ax.scatter(
                 other_xs, other_ys,
-                c=other_colors, s=60, zorder=2,
+                c=other_colors, s=85, zorder=2,
                 edgecolors="#ffffff22", linewidths=0.5,
             )
             for path, (x, y) in zip(other_paths, other_xys):
                 ax.annotate(
                     self._truncate(path.stem), (x, y),
-                    xytext=(4, 4), textcoords="offset points",
+                    xytext=(7, 5), textcoords="offset points",
                     color=_TEXT, fontsize=_LABEL_FS, zorder=3,
                 )
 
@@ -207,15 +228,40 @@ class _VectorDiagram(QWidget):
             qx, qy = coords[query_path]
             ax.scatter(
                 qx, qy,
-                c=_QUERY_PT, s=140, zorder=4,
+                c=_QUERY_PT, s=160, zorder=4,
                 edgecolors="#ffffff66", linewidths=1.0,
             )
             ax.annotate(
                 self._truncate(query_path.stem), (qx, qy),
-                xytext=(4, 4), textcoords="offset points",
+                xytext=(7, 5), textcoords="offset points",
                 color=_QUERY_PT, fontsize=_LABEL_FS + 1,
                 fontweight="bold", zorder=5,
             )
+
+        # ── Legend (only shown in scored state) ──────────────────
+        legend_handles = [
+            Line2D([0], [0], marker="o", color="none",
+                   markerfacecolor=_QUERY_PT, markersize=8,
+                   label="Selected file"),
+            Line2D([0], [0], marker="o", color="none",
+                   markerfacecolor=(0.15, 0.85 * 0.85, 0.15), markersize=8,
+                   label="Most similar"),
+            Line2D([0], [0], marker="o", color="none",
+                   markerfacecolor=(0.85, 0.15 * 0.85, 0.15), markersize=8,
+                   label="Least similar"),
+        ]
+        legend = ax.legend(
+            handles=legend_handles,
+            loc="lower right",
+            fontsize=7,
+            framealpha=0.75,
+            facecolor="#2a2a2a",
+            edgecolor=_SPINE,
+            labelcolor=_TEXT,
+            handletextpad=0.5,
+            borderpad=0.7,
+        )
+        legend.get_frame().set_linewidth(0.5)
 
         self._canvas.draw()
 
