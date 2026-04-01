@@ -44,7 +44,7 @@ _TEXT       = "#dddddd"
 _SUBTLE     = "#888888"
 _SPINE      = "#444444"
 _NEUTRAL_PT = "#5b9bd5"   # steel blue — default points
-_QUERY_PT   = "#ffff00"   # bright yellow — selected file
+_QUERY_PT   = "#00aaff"   # bright blue — selected file
 _LABEL_FS   = 7
 _MAX_LABEL  = 18          # chars before truncation
 
@@ -283,6 +283,26 @@ class _VectorDiagram(QWidget):
         self._colorbar.outline.set_edgecolor(_SPINE)
         self._colorbar.ax.set_facecolor(_BG)
 
+        # ── Selected-file indicator legend ────────────────────────
+        selected_handle = matplotlib.lines.Line2D(
+            [], [], marker="o", color="none",
+            markerfacecolor=_QUERY_PT,
+            markeredgecolor="white", markeredgewidth=1.5,
+            markersize=9, label="Selected file",
+        )
+        leg = ax.legend(
+            handles=[selected_handle],
+            loc="lower left",
+            fontsize=7,
+            framealpha=0.75,
+            facecolor="#2a2a2a",
+            edgecolor=_SPINE,
+            labelcolor=_TEXT,
+            handletextpad=0.5,
+            borderpad=0.7,
+        )
+        leg.get_frame().set_linewidth(0.5)
+
         self._setup_tooltip()
         self._canvas.draw()
 
@@ -390,8 +410,8 @@ class MainWindow(QMainWindow):
 
         # Description
         self.desc_label = QLabel(
-            "Load a folder of WAV files to explore\n"
-            "their audio features and similarity."
+            "Load a folder of audio files to explore\n"
+            "their features and similarity."
         )
         self.desc_label.setObjectName("desc")
 
@@ -593,7 +613,7 @@ class MainWindow(QMainWindow):
         self.vector_diagram.plot_neutral({})
 
         self.dir_label.setText(folder)
-        self.file_count_label.setText(f"{len(wav_files)} WAV file(s) found")
+        self.file_count_label.setText(f"{len(wav_files)} audio file(s) found")
 
         self._start_worker(wav_files)
 
