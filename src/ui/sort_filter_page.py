@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QItemSelection, QItemSelectionModel, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QPushButton, QSlider,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -44,6 +44,7 @@ class SortFilterDialog(QDialog):
         self._build_data_ranges()
         self._build_ui()
         self._populate_table()
+        self._apply_sort()
         self._apply_filters()
 
     # ── Data range pre-computation ────────────────────────────────
@@ -145,6 +146,28 @@ class SortFilterDialog(QDialog):
 
         root.addWidget(panel)
 
+        # ── Sort bar ──────────────────────────────────────────────
+        sort_row = QHBoxLayout()
+        sort_row.setSpacing(8)
+        sort_row.addWidget(_hdr("Sort by:"))
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems([
+            "Filename (A\u2013Z)",
+            "Filename (Z\u2013A)",
+            "Duration (shortest first)",
+            "Duration (longest first)",
+            "RMS Energy (quietest first)",
+            "RMS Energy (loudest first)",
+            "Spectral Centroid (darkest first)",
+            "Spectral Centroid (brightest first)",
+            "Zero Crossing Rate (lowest first)",
+            "Zero Crossing Rate (highest first)",
+        ])
+        self._sort_combo.currentIndexChanged.connect(self._apply_sort)
+        sort_row.addWidget(self._sort_combo)
+        sort_row.addStretch()
+        root.addLayout(sort_row)
+
         # ── Table ─────────────────────────────────────────────────
         self._table = QTableWidget()
         self._table.setColumnCount(5)
@@ -195,6 +218,12 @@ class SortFilterDialog(QDialog):
         lo_lbl.setText(f"{_scale(lo_sl.value(), dmin, dmax):{fmt}}")
         hi_lbl.setText(f"{_scale(hi_sl.value(), dmin, dmax):{fmt}}")
         self._apply_filters()
+
+    # ── Sorting ───────────────────────────────────────────────────
+
+    def _apply_sort(self):
+        col, order = _SORT_MAP[self._sort_combo.currentIndex()]
+        self._table.sortItems(col, order)
 
     # ── Table population ──────────────────────────────────────────
 
@@ -402,10 +431,50 @@ class SortFilterDialog(QDialog):
             QPushButton:pressed {{
                 background-color: #252525;
             }}
+            QComboBox {{
+                background-color: #2a2a2a;
+                color: {_TEXT};
+                border: 1px solid {_SPIN};
+                border-radius: 4px;
+                padding: 5px 8px;
+                font-size: 12px;
+                min-width: 220px;
+            }}
+            QComboBox:hover {{
+                border-color: #6e6e6e;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 22px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #2a2a2a;
+                color: {_TEXT};
+                border: 1px solid {_SPIN};
+                selection-background-color: #2e4a70;
+                selection-color: #ffffff;
+                outline: none;
+            }}
         """)
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
+
+# Maps each sort-combo index → (table column, sort order).
+# Column order: 0=Filename, 1=Duration, 2=RMS, 3=Centroid, 4=ZCR
+_SORT_MAP: list[tuple[int, Qt.SortOrder]] = [
+    (0, Qt.SortOrder.AscendingOrder),   # Filename A–Z
+    (0, Qt.SortOrder.DescendingOrder),  # Filename Z–A
+    (1, Qt.SortOrder.AscendingOrder),   # Duration shortest first
+    (1, Qt.SortOrder.DescendingOrder),  # Duration longest first
+    (2, Qt.SortOrder.AscendingOrder),   # RMS quietest first
+    (2, Qt.SortOrder.DescendingOrder),  # RMS loudest first
+    (3, Qt.SortOrder.AscendingOrder),   # Centroid darkest first
+    (3, Qt.SortOrder.DescendingOrder),  # Centroid brightest first
+    (4, Qt.SortOrder.AscendingOrder),   # ZCR lowest first
+    (4, Qt.SortOrder.DescendingOrder),  # ZCR highest first
+]
+
 
 def _hdr(text: str) -> QLabel:
     lbl = QLabel(text)
