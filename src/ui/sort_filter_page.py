@@ -31,6 +31,7 @@ class SortFilterDialog(QDialog):
     """
 
     apply_selection = pyqtSignal(object)
+    play_file       = pyqtSignal(object)   # emits Path on row double-click
 
     def __init__(self, features: dict, durations: dict, parent=None):
         super().__init__(parent)
@@ -184,6 +185,7 @@ class SortFilterDialog(QDialog):
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.cellDoubleClicked.connect(self._on_row_double_click)
         root.addWidget(self._table)
 
         # ── Bottom buttons ────────────────────────────────────────
@@ -301,6 +303,15 @@ class SortFilterDialog(QDialog):
             self._toggle_btn.setText("Deselect All")
         else:
             self._toggle_btn.setText("Select All")
+
+    # ── Double-click to play ──────────────────────────────────────
+
+    def _on_row_double_click(self, row: int, _col: int):
+        name_item = self._table.item(row, 0)
+        if name_item:
+            path = name_item.data(Qt.ItemDataRole.UserRole)
+            if path is not None:
+                self.play_file.emit(path)
 
     # ── Apply ─────────────────────────────────────────────────────
 
