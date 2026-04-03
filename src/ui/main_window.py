@@ -39,6 +39,7 @@ from src.feature_extractor import extract_features_batch, get_duration
 from src.similarity import score_similarity
 from src import umap_reducer
 from src.ui.sort_filter_page import SortFilterDialog
+from src.ui.duplicate_dialog import DuplicatesDialog, DUP_PALETTE
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,13 @@ class _VectorDiagram(QWidget):
         # Each entry: (data_x, data_y, display_name, score_str | "", path)
         self._hover_pts: list[tuple[float, float, str, str, object]] = []
 
+        # Duplicate-group overlay state
+        self._dup_groups:  list                  = []
+        self._last_coords: dict                  = {}
+        self._last_ranked: list | None           = None
+        self._last_query:  object                = None
+        self._is_scored:   bool                  = False
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._canvas)
@@ -191,7 +199,12 @@ class _VectorDiagram(QWidget):
 
     def _draw_empty(self):
         self._remove_colorbar()
-        self._hover_pts = []
+        self._hover_pts  = []
+        self._dup_groups = []
+        self._last_coords = {}
+        self._last_ranked = None
+        self._last_query  = None
+        self._is_scored   = False
         self._ax.clear()
         self._style_axes()
         self._ax.text(
@@ -211,6 +224,8 @@ class _VectorDiagram(QWidget):
 
     def plot_neutral(self, coords: dict[Path, tuple[float, float]]):
         """Render all files as steel-blue points."""
+        self._last_coords = coords
+        self._is_scored   = False
         self._remove_colorbar()
         self._hover_pts = []
         ax = self._ax
@@ -234,6 +249,7 @@ class _VectorDiagram(QWidget):
             self._hover_pts.append((x, y, path.stem, "", path))
 
         self._setup_tooltip()
+        self._overlay_dup_rings()
         self._canvas.draw()
 
     def plot_scored(
@@ -243,6 +259,10 @@ class _VectorDiagram(QWidget):
         query_path: Path,
     ):
         """Recolor via RdYlGn colormap; query=yellow/white-ring; colorbar on right."""
+        self._last_coords = coords
+        self._last_ranked = ranked
+        self._last_query  = query_path
+        self._is_scored   = True
         self._remove_colorbar()
         self._hover_pts = []
         score_map = {path: score for path, score in ranked}
@@ -312,7 +332,45 @@ class _VectorDiagram(QWidget):
         leg.get_frame().set_linewidth(0.5)
 
         self._setup_tooltip()
+        self._overlay_dup_rings()
         self._canvas.draw()
+
+    # ── Duplicate-group overlay ──────────────────────────────────
+
+    def set_duplicate_groups(self, groups: list) -> None:
+        """Highlight duplicate groups with coloured rings; triggers a redraw."""
+        self._dup_groups = groups
+        self._redraw()
+
+    def clear_duplicate_groups(self) -> None:
+        """Remove duplicate-group rings and redraw."""
+        self._dup_groups = []
+        self._redraw()
+
+    def _redraw(self) -> None:
+        """Replot using the stored last-plot state (neutral or scored)."""
+        if self._is_scored and self._last_ranked is not None:
+            self.plot_scored(self._last_coords, self._last_ranked, self._last_query)
+        else:
+            self.plot_neutral(self._last_coords)
+
+    def _overlay_dup_rings(self) -> None:
+        """Draw a coloured ring around every dot that belongs to a dup group."""
+        if not self._dup_groups or not self._last_coords:
+            return
+        ax = self._ax
+        for i, group in enumerate(self._dup_groups):
+            color = DUP_PALETTE[i % len(DUP_PALETTE)]
+            xs = [self._last_coords[p][0] for p in group if p in self._last_coords]
+            ys = [self._last_coords[p][1] for p in group if p in self._last_coords]
+            if xs:
+                ax.scatter(
+                    xs, ys, s=200,
+                    facecolors="none",
+                    edgecolors=color,
+                    linewidths=2.5,
+                    zorder=4,
+                )
 
     # ── Hover tooltip ────────────────────────────────────────────
 
@@ -458,15 +516,18 @@ class MainWindow(QMainWindow):
         self.status_label.setVisible(False)
 
         # && renders as a literal & in Qt button labels
-        self.btn_load_folder = QPushButton("Load Folder…")
-        self.btn_sort_filter = QPushButton("Sort && Filter")
-        self.btn_check_score = QPushButton("Check && Score")
+        self.btn_load_folder    = QPushButton("Load Folder…")
+        self.btn_sort_filter    = QPushButton("Sort && Filter")
+        self.btn_check_score    = QPushButton("Check && Score")
+        self.btn_find_duplicates = QPushButton("Find Duplicates")
         self.btn_sort_filter.setEnabled(False)
         self.btn_check_score.setEnabled(False)
+        self.btn_find_duplicates.setEnabled(False)
 
         self.btn_load_folder.clicked.connect(self._on_load_folder)
         self.btn_sort_filter.clicked.connect(self._open_sort_filter)
         self.btn_check_score.clicked.connect(self._open_check_score)
+        self.btn_find_duplicates.clicked.connect(self._open_duplicates)
 
         # ── Playback transport ───────────────────────────────────
         self._player_frame = QFrame()
@@ -534,6 +595,8 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.btn_sort_filter)
         lv.addSpacing(3)
         lv.addWidget(self.btn_check_score)
+        lv.addSpacing(3)
+        lv.addWidget(self.btn_find_duplicates)
         lv.addSpacing(10)
         lv.addWidget(self._player_frame)
         lv.addSpacing(14)
@@ -720,6 +783,7 @@ class MainWindow(QMainWindow):
         self.results_header.setVisible(False)
         self.btn_sort_filter.setEnabled(False)
         self.btn_check_score.setEnabled(False)
+        self.btn_find_duplicates.setEnabled(False)
         self.vector_diagram.plot_neutral({})
 
         self.dir_label.setText(folder)
@@ -777,6 +841,7 @@ class MainWindow(QMainWindow):
         self.btn_load_folder.setEnabled(True)
         self.btn_sort_filter.setEnabled(True)
         self.btn_check_score.setEnabled(True)
+        self.btn_find_duplicates.setEnabled(True)
 
         self.vector_diagram.plot_neutral(coords)
 
@@ -848,6 +913,19 @@ class MainWindow(QMainWindow):
         dlg = SortFilterDialog(self._features, self._durations, parent=self)
         dlg.apply_selection.connect(self._apply_filter_to_view)
         dlg.play_file.connect(self._play_file)
+        dlg.exec()
+
+    def _open_duplicates(self):
+        if not self._features:
+            return
+
+        dlg = DuplicatesDialog(self._features, self._durations, parent=self)
+        dlg.groups_changed.connect(self.vector_diagram.set_duplicate_groups)
+        dlg.play_file.connect(self._play_file)
+        dlg.finished.connect(lambda _: self.vector_diagram.clear_duplicate_groups())
+        # Apply the initial detection result to the UMAP immediately
+        # (groups_changed fired during __init__ before the connection was wired)
+        self.vector_diagram.set_duplicate_groups(dlg.current_groups)
         dlg.exec()
 
     def _apply_filter_to_view(self, selected_paths: list):
