@@ -3,7 +3,7 @@
 Left panel
 ----------
   Title → directory path → file count → description
-  Status label (shown during background work)
+  Status label (shown during background work, with live elapsed timer)
   Load Folder / Sort & Filter / Check & Score buttons
   Similarity results list (visible after Check & Score)
 
@@ -12,28 +12,31 @@ Right panel
   Live matplotlib UMAP/PCA cluster map (always visible)
 """
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
 import matplotlib
 import matplotlib.cm
+import matplotlib.lines
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
+    QFileDialog, QFrame, QHBoxLayout,
     QInputDialog, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QPushButton, QSizePolicy,
     QVBoxLayout, QWidget,
 )
 
 from src.audio_loader import load_wav_files, AudioLoaderError
-from src.feature_extractor import extract_features_batch
+from src.feature_extractor import extract_features_batch, get_duration
 from src.similarity import score_similarity
 from src import umap_reducer
+from src.ui.sort_filter_page import SortFilterDialog
 
 logger = logging.getLogger(__name__)
 
@@ -52,15 +55,13 @@ _MAX_LABEL  = 18          # chars before truncation
 # ── Background worker ────────────────────────────────────────────────────────
 
 class _ExtractionWorker(QThread):
-    """Runs feature extraction then UMAP/PCA reduction off the main thread.
+    """Runs feature extraction, duration collection, then UMAP/PCA reduction.
 
     Signals
     -------
-    progress(str)   — status message safe to display in the UI
-    finished(object) — emits tuple (features: dict, coords: dict)
-    error(str)      — human-readable error if the whole run fails
+    finished(object)  — emits tuple (features: dict, coords: dict, durations: dict)
+    error(str)        — human-readable error if the whole run fails
     """
-    progress = pyqtSignal(str)
     finished = pyqtSignal(object)
     error    = pyqtSignal(str)
 
@@ -70,25 +71,31 @@ class _ExtractionWorker(QThread):
 
     def run(self):
         try:
-            self.progress.emit("Extracting features…")
             features = extract_features_batch(self._wav_paths)
 
             if not features:
                 self.error.emit("No features could be extracted from the loaded files.")
                 return
 
-            self.progress.emit("Computing layout…")
+            # Collect per-file durations for the Sort & Filter table
+            durations: dict[Path, float] = {}
+            for path in features:
+                try:
+                    durations[path] = get_duration(path)
+                except Exception:          # noqa: BLE001
+                    durations[path] = 0.0
+
             coords = umap_reducer.reduce(features)
 
-            self.finished.emit((features, coords))
-        except Exception as exc:                    # noqa: BLE001
+            self.finished.emit((features, coords, durations))
+        except Exception as exc:           # noqa: BLE001
             logger.exception("Worker failed")
             self.error.emit(str(exc))
 
 
 # ── Vector diagram ───────────────────────────────────────────────────────────
 
-_CMAP = matplotlib.colormaps["RdYlGn"]   # module-level so it's shared
+_CMAP = matplotlib.colormaps["RdYlGn"]
 _NORM = Normalize(vmin=0.0, vmax=1.0)
 
 
@@ -110,7 +117,6 @@ class _VectorDiagram(QWidget):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
 
-        # State shared across plot calls
         self._colorbar  = None
         self._tooltip   = None
         # Each entry: (data_x, data_y, display_name, score_str | "")
@@ -136,11 +142,8 @@ class _VectorDiagram(QWidget):
         for spine in ax.spines.values():
             spine.set_color(_SPINE)
 
-        # No tick numbers — UMAP coordinates carry no directional meaning
         ax.tick_params(bottom=False, left=False, labelbottom=False, labelleft=False)
 
-        # Title + two subtitle lines stacked just above the axes boundary.
-        # pad=34 reserves enough space so neither subtitle overlaps the title.
         ax.set_title("Audio Similarity Map",
                      color=_TEXT, fontsize=11, fontweight="normal", pad=34)
         ax.annotate(
@@ -160,16 +163,13 @@ class _VectorDiagram(QWidget):
             annotation_clip=False,
         )
 
-        # Axis labels — named A/B since UMAP dimensions have no fixed meaning
         ax.set_xlabel("Acoustic Character (A)", color=_SUBTLE, fontsize=8, labelpad=4)
         ax.set_ylabel("Acoustic Character (B)", color=_SUBTLE, fontsize=8, labelpad=4)
 
-        # Subtle grid behind all artists
         ax.set_axisbelow(True)
         ax.grid(True, color="#2e2e2e", linewidth=0.6, alpha=0.8, zorder=0)
 
     def _setup_tooltip(self):
-        """Create a fresh invisible annotation used as a hover tooltip."""
         self._tooltip = self._ax.annotate(
             "", xy=(0, 0), xytext=(14, 14),
             textcoords="offset points",
@@ -229,8 +229,8 @@ class _VectorDiagram(QWidget):
 
     def plot_scored(
         self,
-        coords: dict[Path, tuple[float, float]],
-        ranked: list[tuple[Path, float]],
+        coords:     dict[Path, tuple[float, float]],
+        ranked:     list[tuple[Path, float]],
         query_path: Path,
     ):
         """Recolor via RdYlGn colormap; query=yellow/white-ring; colorbar on right."""
@@ -242,14 +242,13 @@ class _VectorDiagram(QWidget):
         ax.clear()
         self._style_axes()
 
-        # ── Non-query points (batched scatter) ───────────────────
+        # ── Non-query points ─────────────────────────────────────
         others = [(p, xy) for p, xy in coords.items() if p != query_path]
         if others:
             other_paths, other_xys = zip(*others)
             other_xs     = [xy[0] for xy in other_xys]
             other_ys     = [xy[1] for xy in other_xys]
             other_scores = [score_map.get(p, 0.0) for p in other_paths]
-            # RdYlGn: 0.0 = red, 0.5 = yellow, 1.0 = green
             other_colors = [_CMAP(_NORM(s)) for s in other_scores]
 
             ax.scatter(other_xs, other_ys, c=other_colors, s=85, zorder=2,
@@ -261,7 +260,7 @@ class _VectorDiagram(QWidget):
                             color=_TEXT, fontsize=_LABEL_FS, zorder=3)
                 self._hover_pts.append((x, y, path.stem, f"{score:.3f}"))
 
-        # ── Query point — yellow fill, thick white ring ──────────
+        # ── Query point ──────────────────────────────────────────
         if query_path in coords:
             qx, qy = coords[query_path]
             ax.scatter(qx, qy, c=_QUERY_PT, s=190, zorder=5,
@@ -272,7 +271,7 @@ class _VectorDiagram(QWidget):
                         fontweight="bold", zorder=6)
             self._hover_pts.append((qx, qy, query_path.stem, "selected"))
 
-        # ── Colorbar (scored state only) ─────────────────────────
+        # ── Colorbar ─────────────────────────────────────────────
         sm = matplotlib.cm.ScalarMappable(cmap=_CMAP, norm=_NORM)
         sm.set_array([])
         self._colorbar = self._figure.colorbar(
@@ -283,7 +282,7 @@ class _VectorDiagram(QWidget):
         self._colorbar.outline.set_edgecolor(_SPINE)
         self._colorbar.ax.set_facecolor(_BG)
 
-        # ── Selected-file indicator legend ────────────────────────
+        # ── Legend ───────────────────────────────────────────────
         selected_handle = matplotlib.lines.Line2D(
             [], [], marker="o", color="none",
             markerfacecolor=_QUERY_PT,
@@ -312,14 +311,12 @@ class _VectorDiagram(QWidget):
         if self._tooltip is None or not self._hover_pts:
             return
 
-        # Hide immediately when the cursor leaves the axes
         if event.inaxes != self._ax:
             if self._tooltip.get_visible():
                 self._tooltip.set_visible(False)
                 self._canvas.draw_idle()
             return
 
-        # Find closest point in display (pixel) space
         ax   = self._ax
         hit  = None
         best = float("inf")
@@ -361,10 +358,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Audio Similarity Engine")
         self.resize(1200, 700)
 
-        self._wav_files: list[Path]               = []
-        self._features:  dict[Path, np.ndarray]   = {}
-        self._coords:    dict[Path, tuple[float, float]] = {}
-        self._worker:    _ExtractionWorker | None = None
+        self._wav_files:  list[Path]               = []
+        self._features:   dict[Path, np.ndarray]   = {}
+        self._coords:     dict[Path, tuple[float, float]] = {}
+        self._durations:  dict[Path, float]         = {}
+        self._query_path: Path | None               = None
+        self._worker:     _ExtractionWorker | None  = None
+
+        # Timer state (initialised in _start_worker)
+        self._elapsed_timer: QTimer | None = None
+        self._extraction_start: float      = 0.0
 
         self._build_ui()
         self._apply_dark_theme()
@@ -387,11 +390,9 @@ class MainWindow(QMainWindow):
         lv.setSpacing(0)
         lv.setContentsMargins(4, 8, 12, 8)
 
-        # Title
         self.title_label = QLabel("Audio Similarity Engine")
         self.title_label.setObjectName("appTitle")
 
-        # Info box — directory path + file count inside a bordered frame
         info_box = QFrame()
         info_box.setObjectName("infoBox")
         ib = QVBoxLayout(info_box)
@@ -408,22 +409,20 @@ class MainWindow(QMainWindow):
         ib.addWidget(self.dir_label)
         ib.addWidget(self.file_count_label)
 
-        # Description
         self.desc_label = QLabel(
             "Load a folder of audio files to explore\n"
             "their features and similarity."
         )
         self.desc_label.setObjectName("desc")
 
-        # Status (shown during background processing)
         self.status_label = QLabel("")
         self.status_label.setObjectName("status")
         self.status_label.setVisible(False)
 
-        # Buttons
+        # && renders as a literal & in Qt button labels
         self.btn_load_folder = QPushButton("Load Folder…")
-        self.btn_sort_filter = QPushButton("Sort & Filter")
-        self.btn_check_score = QPushButton("Check & Score")
+        self.btn_sort_filter = QPushButton("Sort && Filter")
+        self.btn_check_score = QPushButton("Check && Score")
         self.btn_sort_filter.setEnabled(False)
         self.btn_check_score.setEnabled(False)
 
@@ -431,7 +430,6 @@ class MainWindow(QMainWindow):
         self.btn_sort_filter.clicked.connect(self._open_sort_filter)
         self.btn_check_score.clicked.connect(self._open_check_score)
 
-        # Results section
         self.results_header = QLabel("Similarity Scores")
         self.results_header.setObjectName("sectionHeader")
         self.results_header.setVisible(False)
@@ -458,7 +456,6 @@ class MainWindow(QMainWindow):
         lv.addWidget(self.results_list)
         lv.addStretch()
 
-        # ── Right: vector diagram ────────────────────────────────
         self.vector_diagram = _VectorDiagram()
 
         h_layout.addWidget(left)
@@ -466,23 +463,18 @@ class MainWindow(QMainWindow):
 
     def _apply_dark_theme(self):
         self.setStyleSheet(f"""
-            /* ── Base ──────────────────────────────────────────── */
             QMainWindow, QWidget {{
                 background-color: {_BG};
                 color: {_TEXT};
                 font-family: "Segoe UI", sans-serif;
                 font-size: 13px;
             }}
-
-            /* ── App title ─────────────────────────────────────── */
             QLabel#appTitle {{
                 font-size: 20px;
                 font-weight: 700;
                 color: #ffffff;
                 letter-spacing: 0.3px;
             }}
-
-            /* ── Info box (directory + file count) ─────────────── */
             QFrame#infoBox {{
                 background-color: #232323;
                 border: 1px solid #363636;
@@ -499,22 +491,16 @@ class MainWindow(QMainWindow):
                 color: #666666;
                 background: transparent;
             }}
-
-            /* ── Description ───────────────────────────────────── */
             QLabel#desc {{
                 color: #707070;
                 font-size: 11px;
                 font-style: italic;
             }}
-
-            /* ── Status line ───────────────────────────────────── */
             QLabel#status {{
                 color: #f0c040;
                 font-size: 11px;
                 padding-bottom: 4px;
             }}
-
-            /* ── Section header (Similarity Scores label) ──────── */
             QLabel#sectionHeader {{
                 color: #5a5a5a;
                 font-size: 9px;
@@ -523,8 +509,6 @@ class MainWindow(QMainWindow):
                 text-transform: uppercase;
                 padding-bottom: 1px;
             }}
-
-            /* ── Buttons ───────────────────────────────────────── */
             QPushButton {{
                 background-color: #2e2e2e;
                 color: {_TEXT};
@@ -548,8 +532,6 @@ class MainWindow(QMainWindow):
                 color: #484848;
                 border-color: #303030;
             }}
-
-            /* ── Similarity results list ────────────────────────── */
             QListWidget {{
                 background-color: #222222;
                 color: {_TEXT};
@@ -573,16 +555,6 @@ class MainWindow(QMainWindow):
             QListWidget::item:hover {{
                 background-color: #2a2a2a;
             }}
-
-            /* ── Dialogs ───────────────────────────────────────── */
-            QDialog {{
-                background-color: {_BG};
-                color: {_TEXT};
-            }}
-            QDialogButtonBox QPushButton {{
-                min-width: 80px;
-                text-align: center;
-            }}
         """)
 
     # ── Folder loading ───────────────────────────────────────────
@@ -601,10 +573,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Load Error", str(exc))
             return
 
-        # Reset state from any previous load
-        self._wav_files = wav_files
-        self._features  = {}
-        self._coords    = {}
+        self._wav_files  = wav_files
+        self._features   = {}
+        self._coords     = {}
+        self._durations  = {}
+        self._query_path = None
         self.results_list.clear()
         self.results_list.setVisible(False)
         self.results_header.setVisible(False)
@@ -618,31 +591,51 @@ class MainWindow(QMainWindow):
         self._start_worker(wav_files)
 
     def _start_worker(self, wav_paths: list[Path]):
+        self._extraction_start = time.monotonic()
+
+        self.status_label.setText("Extracting features... 0:00 elapsed")
         self.status_label.setVisible(True)
         self.btn_load_folder.setEnabled(False)
 
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._elapsed_timer.start()
+
         self._worker = _ExtractionWorker(wav_paths)
-        self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_worker_done)
         self._worker.error.connect(self._on_worker_error)
         self._worker.start()
 
-    def _on_worker_progress(self, message: str):
-        self.status_label.setText(message)
+    def _update_elapsed(self):
+        elapsed = time.monotonic() - self._extraction_start
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        self.status_label.setText(
+            f"Extracting features... {mins}:{secs:02d} elapsed"
+        )
 
     def _on_worker_done(self, result: object):
-        features, coords = result
-        self._features = features
-        self._coords   = coords
+        elapsed = time.monotonic() - self._extraction_start
+        if self._elapsed_timer is not None:
+            self._elapsed_timer.stop()
 
-        n_loaded  = len(self._wav_files)
-        n_ok      = len(features)
-        skipped   = n_loaded - n_ok
+        features, coords, durations = result
+        self._features  = features
+        self._coords    = coords
+        self._durations = durations
 
-        self.file_count_label.setText(
-            f"{n_ok} of {n_loaded} file(s) processed"
-            + (f" · {skipped} skipped" if skipped else "")
+        n_loaded = len(self._wav_files)
+        n_ok     = len(features)
+        skipped  = n_loaded - n_ok
+
+        count_text = (
+            f"{n_ok} of {n_loaded} file(s) processed (took {elapsed:.1f}s)"
         )
+        if skipped:
+            count_text += f" · {skipped} skipped"
+        self.file_count_label.setText(count_text)
+
         self.status_label.setVisible(False)
         self.btn_load_folder.setEnabled(True)
         self.btn_sort_filter.setEnabled(True)
@@ -651,6 +644,8 @@ class MainWindow(QMainWindow):
         self.vector_diagram.plot_neutral(coords)
 
     def _on_worker_error(self, message: str):
+        if self._elapsed_timer is not None:
+            self._elapsed_timer.stop()
         self.status_label.setText("Failed.")
         self.btn_load_folder.setEnabled(True)
         QMessageBox.critical(self, "Pipeline Error", message)
@@ -674,6 +669,7 @@ class MainWindow(QMainWindow):
         if query_path is None:
             return
 
+        self._query_path = query_path
         ranked = score_similarity(self._features[query_path], self._features)
 
         self.vector_diagram.plot_scored(self._coords, ranked, query_path)
@@ -681,7 +677,7 @@ class MainWindow(QMainWindow):
 
     def _show_results(
         self,
-        ranked: list[tuple[Path, float]],
+        ranked:     list[tuple[Path, float]],
         query_path: Path,
     ):
         self.results_list.clear()
@@ -695,7 +691,6 @@ class MainWindow(QMainWindow):
                 bar  = _score_bar(score)
                 text = f"{bar} {path.name}  {score:.3f}"
                 item = QListWidgetItem(text)
-                # Tint the text colour toward green/red to match the diagram
                 r = int((1.0 - score) * 200)
                 g = int(score * 170)
                 item.setForeground(QColor(r, g, 38))
@@ -706,26 +701,37 @@ class MainWindow(QMainWindow):
         self.results_header.setVisible(True)
         self.results_list.setVisible(True)
 
-    # ── Sort & Filter (stub) ─────────────────────────────────────
+    # ── Sort & Filter ────────────────────────────────────────────
 
     def _open_sort_filter(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Sort & Filter")
-        dlg.setMinimumWidth(320)
+        if not self._features:
+            return
 
-        layout = QVBoxLayout(dlg)
-        layout.setSpacing(16)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        msg = QLabel("Sort & Filter coming soon.")
-        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(msg)
-
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-        btns.accepted.connect(dlg.accept)
-        layout.addWidget(btns)
-
+        dlg = SortFilterDialog(self._features, self._durations, parent=self)
+        dlg.apply_selection.connect(self._apply_filter_to_view)
         dlg.exec()
+
+    def _apply_filter_to_view(self, selected_paths: list):
+        """Update the diagram to show only the user-selected subset."""
+        if not selected_paths:
+            return
+
+        active = set(selected_paths)
+        filtered_coords = {p: c for p, c in self._coords.items() if p in active}
+
+        if self._query_path and self._query_path in active:
+            # Re-score within the filtered subset
+            active_features = {
+                p: self._features[p] for p in active if p in self._features
+            }
+            ranked = score_similarity(
+                self._features[self._query_path], active_features
+            )
+            self.vector_diagram.plot_scored(filtered_coords, ranked, self._query_path)
+            self._show_results(ranked, self._query_path)
+        else:
+            self._query_path = None
+            self.vector_diagram.plot_neutral(filtered_coords)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
